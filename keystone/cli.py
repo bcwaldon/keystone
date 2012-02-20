@@ -100,12 +100,12 @@ class ImportNovaAuth(BaseApp):
 
     def __init__(self, *args, **kw):
         super(ImportNovaAuth, self).__init__(*args, **kw)
-        self.add_param('dump_file', nargs=1,
-                       help=('File containing dump of Nova auth data'))
 
     def main(self):
         from keystone.common.sql import nova
-        dump_file = self.params.dump_file[0]
+        if len(self.argv) < 2:
+            return self.missing_param('dump_file')
+        dump_file = self.argv[1]
         dump_data = json.loads(open(dump_file).read())
         nova.import_auth(dump_data)
 

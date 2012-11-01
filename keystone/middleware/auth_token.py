@@ -159,6 +159,18 @@ opts = [
 CONF.register_opts(opts, group='keystone_authtoken')
 
 
+def will_expire_soon(expiry, soon_seconds=30):
+    """ Determines if expiration will occur 'soon'
+
+    :param expiry: a datetime of the expected expiration
+    :param soon_seconds: number of seconds that defines 'soon'
+    :returns: boolean : true if expiration is within 30 seconds
+    """
+    soon = (datetime.datetime.utcnow() +
+            datetime.timedelta(seconds=soon_seconds))
+    return expiry < soon
+
+
 class InvalidUserToken(Exception):
     pass
 
@@ -230,6 +242,7 @@ class AuthProtocol(object):
         # Credentials used to verify this component with the Auth service since
         # validating tokens is a privileged call
         self.admin_token = self._conf_get('admin_token')
+        self.admin_token_expiry = None
         self.admin_user = self._conf_get('admin_user')
         self.admin_password = self._conf_get('admin_password')
         self.admin_tenant_name = self._conf_get('admin_tenant_name')
@@ -345,12 +358,21 @@ class AuthProtocol(object):
     def get_admin_token(self):
         """Return admin token, possibly fetching a new one.
 
+        if self.admin_token_expiry is set from fetching an admin token, check
+        it for expiration, and request a new token is the existing token
+        is about to expire.
+
         :return admin token id
         :raise ServiceError when unable to retrieve token from keystone
 
         """
+        if self.admin_token_expiry:
+            if will_expire_soon(self.admin_token_expiry):
+                self.admin_token = None
+
         if not self.admin_token:
-            self.admin_token = self._request_admin_token()
+            (self.admin_token,
+             self.admin_token_expiry) = self._request_admin_token()
 
         return self.admin_token
 
@@ -455,11 +477,20 @@ class AuthProtocol(object):
 
         try:
             token = data['access']['token']['id']
+            expiry = data['access']['token']['expires']
             assert token
-            return token
+            assert expiry
         except (AssertionError, KeyError):
             LOG.warn("Unexpected response from keystone service: %s", data)
             raise ServiceError('invalid json response')
+
+        try:
+            datetime_expiry = timeutils.parse_isotime(expiry)
+        except ValueError:
+            LOG.warn("Unable to parse expiration time from token: %s", data)
+            raise ServiceError('invalid token expiry value')
+
+        return (token, datetime_expiry)
 
     def _validate_user_token(self, user_token, retry=True):
         """Authenticate user using PKI
@@ -771,10 +802,16 @@ class AuthProtocol(object):
         with open(self.revoked_file_name, 'w') as f:
             f.write(value)
 
-    def fetch_revocation_list(self):
+    def fetch_revocation_list(self, retry=True):
         headers = {'X-Auth-Token': self.get_admin_token()}
         response, data = self._json_request('GET', '/v2.0/tokens/revoked',
                                             additional_headers=headers)
+        if response.status == 401:
+            if retry:
+                LOG.info('Keystone rejected admin token %s, resetting admin '
+                         'token', headers)
+                self.admin_token = None
+                return self.fetch_revocation_list(retry=False)
         if response.status != 200:
             raise ServiceError('Unable to fetch token revocation list.')
         if (not 'signed' in data):
